@@ -1,0 +1,11 @@
+aiohttp
+requests
+asyncpraw
+sentence-transformers
+numpy
+scikit-learn
+python-dotenv
+pandas
+pytrends
+openpyxl
+lxml
