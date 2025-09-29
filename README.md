@@ -1,1 +1,2 @@
 # redditbot
+# reddit-bot
