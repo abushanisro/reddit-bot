@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-SEO Opportunity Monitor - Production Version
-Real-time Telegram control, no duplicates, keyword-based search
+SEO Opportunity Monitor - Optimized Version
+Performance improvements:
+- Aho-Corasick for O(m) keyword matching
+- Cached control state with TTL
+- Batched stats persistence
+- Parallel keyword searches
+- Connection pooling
+- Memory-efficient LRU cache for seen posts
 """
 import os
 import sys
@@ -15,8 +21,11 @@ from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 import pandas as pd
 import asyncpraw
+import ahocorasick
 import aiohttp
 from dotenv import load_dotenv
 
@@ -51,8 +60,12 @@ COMMAND_POLL_INTERVAL = 5
 SCAN_INTERVAL = 300
 PRIMARY_KW_COUNT = 10
 SECONDARY_KW_PER_CYCLE = 20
+BATCH_SIZE = 5  # Parallel keyword searches
+STATE_MAX_SIZE = 10000  # LRU cache size
+STATS_FLUSH_INTERVAL = 60  # seconds
+CONTROL_CACHE_TTL = 5  # seconds
 
-# Competitors - BLOCKED SUBREDDITS
+# Competitors
 COMPETITOR_SUBREDDITS = {
     'binance', 'coinbase', 'kraken', 'cryptocom', 'gemini', 'kucoin',
     'okx', 'bybit', 'mexc', 'uphold', 'bitfinex', 'bitmart', 'bitstamp',
@@ -62,7 +75,6 @@ COMPETITOR_SUBREDDITS = {
     'dodoex', 'kyberswap'
 }
 
-# Competitor names for awareness tracking
 COMPETITORS = {
     'Binance', 'Coinbase', 'Kraken', 'Crypto.com', 'Gemini', 'KuCoin',
     'OKX', 'Bybit', 'MEXC', 'Uphold', 'Bitfinex', 'Bitmart', 'Bitstamp',
@@ -72,7 +84,6 @@ COMPETITORS = {
     'DODO', 'KyberSwap'
 }
 
-# Spam patterns for ad filtering
 SPAM_PATTERNS = [
     r'\b(buy now|click here|limited offer|promo code|referral|affiliate)\b',
     r'\b(discount|sale|shop|coupon|deal|earn money|get paid)\b',
@@ -80,6 +91,17 @@ SPAM_PATTERNS = [
     r'\b(dm me|telegram group|whatsapp)\b',
     r'\b(guaranteed profit|moonshot|lambo|pump)\b'
 ]
+
+# ----------------------------- Performance Timer -----------------------------
+@asynccontextmanager
+async def timer(name: str):
+    """Context manager for timing operations"""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        logger.debug(f"⏱️ {name}: {elapsed:.3f}s")
 
 # ----------------------------- Data Models -----------------------------
 @dataclass
@@ -140,14 +162,13 @@ class SEOOpportunity:
         comments = self.engagement.get('num_comments', 0)
         msg += f"💬 *Engagement:* ↑{score} \\| 💬{comments} comments\n"
         
-        # Show snippet of content if competitors mentioned
         if self.matched_competitors and self.content:
             snippet = self._escape_md(self.content[:200])
             msg += f"\n📄 *Snippet:* {snippet}\\.\\.\\.\n"
         
         return msg
 
-# ----------------------------- Keyword Manager -----------------------------
+# ----------------------------- Keyword Manager with Aho-Corasick -----------------------------
 class KeywordManager:
     def __init__(self, df: pd.DataFrame):
         self.df = df
@@ -155,8 +176,11 @@ class KeywordManager:
         self.secondary_keywords = []
         self.competitor_pattern = None
         self.india_pattern = None
+        self._automaton = None
+        self._secondary_index = 0
         self._process_keywords()
         self._build_patterns()
+        self._build_automaton()
     
     def _process_keywords(self):
         kw_col = next((c for c in ['Keyword', 'keyword', 'Keywords'] if c in self.df.columns), self.df.columns[0])
@@ -199,6 +223,21 @@ class KeywordManager:
                        'bangalore', 'bengaluru', 'kolkata', 'chennai', 'hyderabad']
         self.india_pattern = re.compile(r'\b(' + '|'.join(india_terms) + r')\b', re.I)
     
+    def _build_automaton(self):
+        """Build Aho-Corasick automaton for O(m) keyword matching"""
+        logger.info("Building Aho-Corasick automaton...")
+        self._automaton = ahocorasick.Automaton()
+        
+        # Add all keywords with priority metadata
+        for kw, vol in self.primary_keywords:
+            self._automaton.add_word(kw, (kw, True, vol))
+        
+        for kw, vol in self.secondary_keywords:
+            self._automaton.add_word(kw, (kw, False, vol))
+        
+        self._automaton.make_automaton()
+        logger.info("✓ Automaton built")
+    
     def is_spam(self, text: str) -> bool:
         text_lower = text.lower()
         return any(re.search(pattern, text_lower) for pattern in SPAM_PATTERNS)
@@ -207,62 +246,68 @@ class KeywordManager:
         return bool(self.india_pattern.search(text))
     
     def find_matches(self, text: str) -> Tuple[List[str], List[str], str, bool]:
+        """Optimized keyword matching using Aho-Corasick"""
         if not text:
             return [], [], "secondary", False
         
         text_lower = text.lower()
         matched_kws = []
         priority = "secondary"
+        seen_kws = set()
         
-        # Check primary keywords first
-        for kw, _ in self.primary_keywords:
-            if len(kw) <= 3:
-                if re.search(r'\b' + re.escape(kw) + r'\b', text_lower):
-                    matched_kws.append(kw)
-                    priority = "primary"
-            else:
-                if kw in text_lower:
-                    matched_kws.append(kw)
-                    priority = "primary"
-        
-        # Check secondary keywords
-        for kw, _ in self.secondary_keywords[:200]:
-            if kw in matched_kws:
+        # O(m) complexity for all keywords at once
+        for end_idx, (kw, is_primary, vol) in self._automaton.iter(text_lower):
+            if kw in seen_kws:
                 continue
+            
+            # Word boundary check for short keywords
             if len(kw) <= 3:
-                if re.search(r'\b' + re.escape(kw) + r'\b', text_lower):
-                    matched_kws.append(kw)
-            else:
-                if kw in text_lower:
-                    matched_kws.append(kw)
+                start_idx = end_idx - len(kw) + 1
+                if start_idx > 0 and text_lower[start_idx-1].isalnum():
+                    continue
+                if end_idx < len(text_lower)-1 and text_lower[end_idx+1].isalnum():
+                    continue
+            
+            matched_kws.append(kw)
+            seen_kws.add(kw)
+            if is_primary:
+                priority = "primary"
         
+        # Competitor matching
         matched_comps = []
         if self.competitor_pattern:
             comps = self.competitor_pattern.findall(text_lower)
             matched_comps = list(set(comps))
         
         india = self.is_india_related(text)
-        
         return matched_kws, matched_comps, priority, india
     
     def get_search_keywords(self) -> Tuple[List[str], List[str]]:
+        """Round-robin keyword selection for secondary keywords"""
         primary = [k for k, _ in self.primary_keywords]
         
-        import random
-        random.seed(int(time.time() / 3600))
+        # Round-robin through secondary keywords
+        start = self._secondary_index
+        end = min(start + SECONDARY_KW_PER_CYCLE, len(self.secondary_keywords))
+        secondary = [k for k, _ in self.secondary_keywords[start:end]]
         
-        if len(self.secondary_keywords) > SECONDARY_KW_PER_CYCLE:
-            secondary = random.sample([k for k, _ in self.secondary_keywords], SECONDARY_KW_PER_CYCLE)
+        # Wrap around if needed
+        if len(secondary) < SECONDARY_KW_PER_CYCLE and self.secondary_keywords:
+            remaining = SECONDARY_KW_PER_CYCLE - len(secondary)
+            secondary += [k for k, _ in self.secondary_keywords[:remaining]]
+            self._secondary_index = remaining
         else:
-            secondary = [k for k, _ in self.secondary_keywords]
+            self._secondary_index = end % len(self.secondary_keywords) if self.secondary_keywords else 0
         
         return primary, secondary
 
-# ----------------------------- Stats Manager -----------------------------
+# ----------------------------- Stats Manager with Batched Writes -----------------------------
 class StatsManager:
     def __init__(self):
         self.stats_file = Path(STATS_FILE)
         self.opportunities = []
+        self._dirty = False
+        self._lock = asyncio.Lock()
         self.load()
     
     def load(self):
@@ -277,19 +322,29 @@ class StatsManager:
             except Exception as e:
                 logger.error(f"Error loading stats: {e}")
     
-    def add_opportunity(self, opp: SEOOpportunity):
-        self.opportunities.append(asdict(opp))
-        self.save()
+    async def add_opportunity(self, opp: SEOOpportunity):
+        async with self._lock:
+            self.opportunities.append(asdict(opp))
+            self._dirty = True
     
-    def save(self):
-        try:
-            with open(self.stats_file, 'w') as f:
-                json.dump({
-                    'date': datetime.now().strftime('%Y-%m-%d'),
-                    'opportunities': self.opportunities
-                }, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving stats: {e}")
+    async def save(self, force=False):
+        if not (self._dirty or force):
+            return
+        
+        async with self._lock:
+            if not (self._dirty or force):
+                return
+            
+            try:
+                with open(self.stats_file, 'w') as f:
+                    json.dump({
+                        'date': datetime.now().strftime('%Y-%m-%d'),
+                        'opportunities': self.opportunities
+                    }, f, indent=2)
+                self._dirty = False
+                logger.debug("Stats saved to disk")
+            except Exception as e:
+                logger.error(f"Error saving stats: {e}")
     
     def get_india_opportunities(self) -> List[Dict]:
         return [opp for opp in self.opportunities if opp.get('india_related', False)]
@@ -302,15 +357,16 @@ class StatsManager:
                     data = json.load(f)
                     if data.get('date') != today:
                         self.opportunities = []
-                        self.save()
+                        asyncio.create_task(self.save(force=True))
             except:
                 pass
 
-# ----------------------------- State Manager -----------------------------
+# ----------------------------- State Manager with LRU Cache -----------------------------
 class StateManager:
-    def __init__(self):
+    def __init__(self, max_size=STATE_MAX_SIZE):
         self.state_file = Path(STATE_FILE)
-        self.seen_posts = {}
+        self.seen_posts = OrderedDict()
+        self.max_size = max_size
         self._lock = asyncio.Lock()
         self.load()
     
@@ -320,7 +376,10 @@ class StateManager:
                 with open(self.state_file) as f:
                     data = json.load(f)
                     cutoff = time.time() - (MAX_POST_AGE_HOURS * 3600)
-                    self.seen_posts = {k: v for k, v in data.items() if v > cutoff}
+                    # Load as OrderedDict
+                    for k, v in data.items():
+                        if v > cutoff:
+                            self.seen_posts[k] = v
                 logger.info(f"Loaded {len(self.seen_posts)} seen posts")
             except Exception as e:
                 logger.error(f"Error loading state: {e}")
@@ -329,7 +388,7 @@ class StateManager:
         async with self._lock:
             try:
                 with open(self.state_file, 'w') as f:
-                    json.dump(self.seen_posts, f)
+                    json.dump(dict(self.seen_posts), f)
             except Exception as e:
                 logger.error(f"Error saving state: {e}")
     
@@ -339,14 +398,22 @@ class StateManager:
     
     async def mark_seen(self, post_id: str):
         async with self._lock:
+            # Evict oldest if at capacity
+            if len(self.seen_posts) >= self.max_size:
+                self.seen_posts.popitem(last=False)
+            
             self.seen_posts[post_id] = time.time()
+            # Move to end (most recently used)
+            self.seen_posts.move_to_end(post_id)
 
-# ----------------------------- Control Manager -----------------------------
+# ----------------------------- Control Manager with Cached State -----------------------------
 class ControlManager:
     def __init__(self):
         self.file = Path(CONTROL_FILE)
         self.running = True
         self.india_only = False
+        self._last_load = 0
+        self._cache_ttl = CONTROL_CACHE_TTL
         self.load()
     
     def load(self):
@@ -356,7 +423,8 @@ class ControlManager:
                     data = json.load(f)
                     self.running = data.get('running', True)
                     self.india_only = data.get('india_only', False)
-                logger.info(f"Control state: running={self.running}, india_only={self.india_only}")
+                    self._last_load = time.time()
+                logger.debug(f"Control state: running={self.running}, india_only={self.india_only}")
             except Exception as e:
                 logger.error(f"Error loading control: {e}")
     
@@ -388,11 +456,15 @@ class ControlManager:
         self.save()
     
     def should_run(self) -> bool:
+        """Cached control state with TTL to avoid excessive file I/O"""
+        now = time.time()
+        if now - self._last_load > self._cache_ttl:
+            self.load()
         return self.running
 
 # ----------------------------- Telegram Handler -----------------------------
 class TelegramHandler:
-    def __init__(self, control: ControlManager, stats: 'StatsManager'):
+    def __init__(self, control: ControlManager, stats: StatsManager):
         self.token = TELEGRAM_BOT_TOKEN
         self.chat_id = TELEGRAM_CHAT_ID
         self.control = control
@@ -536,17 +608,14 @@ class TelegramHandler:
         await self._send_message(msg)
     
     async def _handle_global(self):
-        """Switch to global mode and show global report"""
         self.control.set_global()
         
         all_opps = self.stats.opportunities
         india_opps = self.stats.get_india_opportunities()
         global_opps = [o for o in all_opps if not o.get('india_related', False)]
         
-        # Group by priority
         primary = [o for o in all_opps if o.get('keyword_priority') == 'primary']
         
-        # Extract top keywords and competitors
         all_keywords = {}
         all_competitors = {}
         
@@ -559,7 +628,6 @@ class TelegramHandler:
         top_kw = sorted(all_keywords.items(), key=lambda x: x[1], reverse=True)[:5]
         top_comp = sorted(all_competitors.items(), key=lambda x: x[1], reverse=True)[:5]
         
-        # Build report
         msg = f"🌍 *Global Coverage Report*\n"
         msg += f"_{datetime.now().strftime('%Y\\-%m\\-%d')}_\n"
         msg += "\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\n\n"
@@ -595,7 +663,6 @@ class TelegramHandler:
         logger.info(f"✓ Switched to GLOBAL mode | Report sent: {len(all_opps)} opportunities")
     
     async def _handle_help(self):
-        """Show help message with available commands"""
         msg = (
             "🤖 *SEO Monitor Bot*\n\n"
             "*Available Commands:*\n"
@@ -633,11 +700,9 @@ class TelegramHandler:
             logger.info("✓ Switched to INDIA-ONLY mode (no opportunities yet)")
             return
         
-        # Group by keyword priority
         primary = [o for o in india_opps if o.get('keyword_priority') == 'primary']
         secondary = [o for o in india_opps if o.get('keyword_priority') == 'secondary']
         
-        # Extract top keywords and competitors
         all_keywords = {}
         all_competitors = {}
         
@@ -650,7 +715,6 @@ class TelegramHandler:
         top_kw = sorted(all_keywords.items(), key=lambda x: x[1], reverse=True)[:5]
         top_comp = sorted(all_competitors.items(), key=lambda x: x[1], reverse=True)[:5]
         
-        # Build report
         msg = f"🇮🇳 *India\\-Specific Report*\n"
         msg += f"_{datetime.now().strftime('%Y\\-%m\\-%d')}_\n"
         msg += "\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\\=\n\n"
@@ -673,9 +737,8 @@ class TelegramHandler:
                 msg += f"  • {safe_comp}: {count}\n"
             msg += "\n"
         
-        # Recent opportunities
         msg += "*📌 Recent Opportunities:*\n"
-        for opp in india_opps[-5:]:  # Last 5
+        for opp in india_opps[-5:]:
             title = self._escape_md(opp['title'][:60])
             subreddit = self._escape_md(opp['subreddit'])
             msg += f"• r/{subreddit}: {title}\\.\\.\\.\n"
@@ -718,7 +781,7 @@ class TelegramHandler:
         if self.session and not self.session.closed:
             await self.session.close()
 
-# ----------------------------- Reddit Monitor -----------------------------
+# ----------------------------- Reddit Monitor with Parallelization -----------------------------
 class RedditMonitor:
     def __init__(self, km, tg, state, control, stats):
         self.km = km
@@ -727,35 +790,71 @@ class RedditMonitor:
         self.control = control
         self.stats = stats
         self.reddit = None
+        self._reddit_lock = asyncio.Lock()
         self.found_today = 0
-    
-    async def init_reddit(self):
-        self.reddit = asyncpraw.Reddit(
-            client_id=REDDIT_CLIENT_ID,
-            client_secret=REDDIT_CLIENT_SECRET,
-            user_agent=REDDIT_USER_AGENT
-        )
+     
+    async def ensure_reddit(self):
+        """Lazy initialization with connection reuse"""
+        if self.reddit is None:
+            async with self._reddit_lock:
+                if self.reddit is None:
+                    self.reddit = asyncpraw.Reddit(
+                        client_id=REDDIT_CLIENT_ID,
+                        client_secret=REDDIT_CLIENT_SECRET,
+                        user_agent=REDDIT_USER_AGENT
+                    )
     
     async def scan(self, primary_kws, secondary_kws):
-        await self.init_reddit()
+        """Parallel keyword scanning with batching"""
+        await self.ensure_reddit()
         all_kws = primary_kws + secondary_kws
         
         logger.info(f"🔍 Starting scan: {len(primary_kws)} primary + {len(secondary_kws)} secondary")
         
-        for idx, kw in enumerate(all_kws, 1):
+        total_found = 0
+        
+        # Process in batches for parallelization
+        for i in range(0, len(all_kws), BATCH_SIZE):
             if not self.control.should_run():
                 logger.warning("⚠️ Scan stopped by user command")
                 break
             
-            is_primary = kw in primary_kws
-            logger.info(f"[{idx}/{len(all_kws)}] Searching: '{kw}' ({'PRIMARY' if is_primary else 'secondary'})")
+            batch = all_kws[i:i+BATCH_SIZE]
+            is_primary_batch = [kw in primary_kws for kw in batch]
             
-            try:
+            # Parallel search within batch
+            results = await asyncio.gather(
+                *[self._search_keyword(kw, is_primary, idx+i+1, len(all_kws)) 
+                  for idx, (kw, is_primary) in enumerate(zip(batch, is_primary_batch))],
+                return_exceptions=True
+            )
+            
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.error(f"Batch search error: {result}")
+                else:
+                    total_found += result
+            
+            # Rate limit between batches
+            await asyncio.sleep(1.0)
+        
+        self.found_today = total_found
+        return total_found
+    
+    async def _search_keyword(self, kw: str, is_primary: bool, idx: int, total: int) -> int:
+        """Search single keyword - parallelizable"""
+        logger.info(f"[{idx}/{total}] Searching: '{kw}' ({'PRIMARY' if is_primary else 'secondary'})")
+        
+        found = 0
+        
+        try:
+            async with timer(f"Keyword '{kw}'"):
                 subreddit = await self.reddit.subreddit('all')
                 count = 0
                 
                 async for sub in subreddit.search(kw, sort='new', time_filter='day', limit=15):
                     if not self.control.should_run():
+                        logger.warning("⚠️ Submission processing interrupted by stop command")
                         break
                     
                     count += 1
@@ -780,7 +879,7 @@ class RedditMonitor:
                     except:
                         pass
                     
-                    # Process
+                    # Process post
                     try:
                         processed = await asyncio.wait_for(
                             self._process_post(sub, post_id, is_primary),
@@ -788,8 +887,8 @@ class RedditMonitor:
                         )
                         
                         if processed:
-                            self.found_today += 1
-                            logger.info(f"  ✅ OPPORTUNITY #{self.found_today}")
+                            found += 1
+                            logger.info(f"  ✅ OPPORTUNITY #{self.found_today + found}")
                     
                     except asyncio.TimeoutError:
                         logger.warning(f"  ⏱️ Timeout processing post")
@@ -798,21 +897,21 @@ class RedditMonitor:
                         logger.error(f"  ❌ Error: {e}")
                         await self.state.mark_seen(post_id)
                     
+                    if not self.control.should_run():
+                        logger.warning("⚠️ Stop command detected, halting scan")
+                        break
+                    
                     await asyncio.sleep(0.3)
                 
-                logger.info(f"  ✓ Processed {count} posts for '{kw}'")
-            
-            except Exception as e:
-                logger.error(f"❌ Search error for '{kw}': {e}")
-            
-            await asyncio.sleep(1.0)
+                logger.info(f"  ✓ Processed {count} posts for '{kw}' ({found} opportunities)")
         
-        if self.reddit:
-            await self.reddit.close()
+        except Exception as e:
+            logger.error(f"❌ Search error for '{kw}': {e}")
         
-        return self.found_today
+        return found
     
     async def _process_post(self, sub, post_id, is_primary):
+        """Process individual post"""
         try:
             title = str(sub.title) if sub.title else ""
             selftext = str(sub.selftext) if hasattr(sub, 'selftext') and sub.selftext else ""
@@ -820,23 +919,24 @@ class RedditMonitor:
             
             if not text:
                 return False
-            
+
             # Spam check
             if self.km.is_spam(text):
                 logger.debug(f"  ↳ FILTERED: Spam/advertising")
                 await self.state.mark_seen(post_id)
                 return False
-            
-            # Find matches
+
+            # Find matches using optimized Aho-Corasick
             kws, comps, priority, india = self.km.find_matches(text)
-            
-            # Only process if we have matches
+
             if not (kws or comps):
+                await self.state.mark_seen(post_id)
                 return False
-            
-            # Filter by mode: India-only or Global
+
+            # Filter by mode
             if self.control.india_only and not india:
                 logger.debug(f"  ↳ SKIPPED: Not India-related (India-only mode)")
+                await self.state.mark_seen(post_id)
                 return False
             
             logger.info(f"  🎯 MATCH: {len(kws)} kw, {len(comps)} comp, {priority}, india={india}")
@@ -887,8 +987,8 @@ class RedditMonitor:
             except:
                 pass
             
-            # Save to stats
-            self.stats.add_opportunity(opp)
+            # Save to stats (batched)
+            await self.stats.add_opportunity(opp)
             
             return True
         
@@ -896,11 +996,16 @@ class RedditMonitor:
             logger.error(f"  ❌ Process error: {e}")
             await self.state.mark_seen(post_id)
             return False
+    
+    async def close(self):
+        """Clean up Reddit connection"""
+        if self.reddit:
+            await self.reddit.close()
 
 # ----------------------------- Main Loop -----------------------------
 async def main():
     logger.info("=" * 80)
-    logger.info("🚀 SEO MONITOR - PRODUCTION VERSION")
+    logger.info("🚀 SEO MONITOR - OPTIMIZED VERSION")
     logger.info("=" * 80)
     
     if not os.path.exists(KEYWORD_FILE):
@@ -915,7 +1020,7 @@ async def main():
         df = pd.read_csv(KEYWORD_FILE)
     logger.info(f"✓ Loaded {len(df)} keywords")
     
-    # Initialize
+    # Initialize components
     km = KeywordManager(df)
     state = StateManager()
     stats = StatsManager()
@@ -924,9 +1029,15 @@ async def main():
     monitor = RedditMonitor(km, tg, state, control, stats)
     
     logger.info("✅ ALL SYSTEMS READY")
+    logger.info(f"⚙️ Config: BATCH_SIZE={BATCH_SIZE}, CACHE_TTL={CONTROL_CACHE_TTL}s, LRU_SIZE={STATE_MAX_SIZE}")
     logger.info("=" * 80)
     
+    # Start command polling task
     command_task = asyncio.create_task(command_loop(tg))
+    
+    # Stats flushing task
+    stats_task = asyncio.create_task(stats_flush_loop(stats))
+    
     cycle = 0
     
     try:
@@ -946,15 +1057,20 @@ async def main():
             # Reset stats for new day
             stats.reset_if_new_day()
             
+            # Get keywords for this cycle
             primary, secondary = km.get_search_keywords()
             logger.info(f"📋 Searching {len(primary)} primary + {len(secondary)} secondary keywords")
             
-            found = await monitor.scan(primary, secondary)
+            # Scan with timing
+            async with timer(f"Cycle #{cycle}"):
+                found = await monitor.scan(primary, secondary)
             
+            # Save state
             await state.save()
             control.save()
             
             logger.info(f"📊 Cycle complete: {found} opportunities found")
+            logger.info(f"💾 Seen posts: {len(state.seen_posts)} | Total opportunities: {len(stats.opportunities)}")
             logger.info(f"⏳ Waiting {SCAN_INTERVAL}s before next cycle...\n")
             
             await asyncio.sleep(SCAN_INTERVAL)
@@ -965,17 +1081,33 @@ async def main():
         logger.exception(f"❌ Fatal error: {e}")
     finally:
         logger.info("🛑 Shutting down...")
+        
+        # Cancel background tasks
         command_task.cancel()
+        stats_task.cancel()
+        
         try:
             await command_task
         except:
             pass
-        await tg.close()
+        
+        try:
+            await stats_task
+        except:
+            pass
+        
+        # Final save
+        await stats.save(force=True)
         await state.save()
+        
+        # Close connections
+        await tg.close()
+        await monitor.close()
+        
         logger.info("✓ Shutdown complete")
 
 async def command_loop(tg):
-    """Separate task for checking Telegram commands"""
+    """Background task for checking Telegram commands"""
     while True:
         try:
             await tg.check_commands()
@@ -985,6 +1117,17 @@ async def command_loop(tg):
         except Exception as e:
             logger.error(f"Command loop error: {e}")
             await asyncio.sleep(10)
+
+async def stats_flush_loop(stats):
+    """Background task for periodic stats flushing"""
+    while True:
+        try:
+            await asyncio.sleep(STATS_FLUSH_INTERVAL)
+            await stats.save(force=True)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"Stats flush error: {e}")
 
 if __name__ == '__main__':
     try:
