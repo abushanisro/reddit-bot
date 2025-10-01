@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-SEO Opportunity Monitor - Optimized Version
+SEO Opportunity Monitor - Optimized Version with Instant Real-Time Control
 Performance improvements:
 - Aho-Corasick for O(m) keyword matching
-- Cached control state with TTL
+- Zero-cache control state for instant commands
 - Batched stats persistence
 - Parallel keyword searches
 - Connection pooling
 - Memory-efficient LRU cache for seen posts
+- Health check HTTP server for Render deployment
+- INSTANT real-time start/stop/mode switching
 """
 import os
 import sys
@@ -16,6 +18,7 @@ import time
 import json
 import asyncio
 import logging
+
 from datetime import datetime, UTC
 from typing import List, Dict, Set, Tuple
 from dataclasses import dataclass, asdict
@@ -27,10 +30,18 @@ import pandas as pd
 import asyncpraw
 import ahocorasick
 import aiohttp
+from aiohttp import web
+
 from dotenv import load_dotenv
 
-# ----------------------------- Configuration -----------------------------
 load_dotenv()
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+
+
+# ----------------------------- Configuration -----------------------------
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,6 +62,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
 # Settings
+HEALTH_CHECK_PORT = int(os.getenv('PORT', 8080))  # Render uses PORT env variable
 MAX_POST_AGE_HOURS = 24
 KEYWORD_FILE = os.getenv('KEYWORD_CSV_PATH', 'crypto_broad-match.xlsx')
 STATE_FILE = "monitor_state.json"
@@ -58,12 +70,12 @@ CONTROL_FILE = "monitor_control.json"
 STATS_FILE = "daily_stats.json"
 COMMAND_POLL_INTERVAL = 5
 SCAN_INTERVAL = 300
-PRIMARY_KW_COUNT = 10
-SECONDARY_KW_PER_CYCLE = 20
+PRIMARY_KW_COUNT = 15
+SECONDARY_KW_PER_CYCLE = 30
 BATCH_SIZE = 5  # Parallel keyword searches
 STATE_MAX_SIZE = 10000  # LRU cache size
 STATS_FLUSH_INTERVAL = 60  # seconds
-CONTROL_CACHE_TTL = 5  # seconds
+CONTROL_CACHE_TTL = 0  # INSTANT - no caching delay for commands
 
 # Competitors
 COMPETITOR_SUBREDDITS = {
@@ -406,7 +418,7 @@ class StateManager:
             # Move to end (most recently used)
             self.seen_posts.move_to_end(post_id)
 
-# ----------------------------- Control Manager with Cached State -----------------------------
+# ----------------------------- Control Manager with INSTANT Response -----------------------------
 class ControlManager:
     def __init__(self):
         self.file = Path(CONTROL_FILE)
@@ -456,11 +468,15 @@ class ControlManager:
         self.save()
     
     def should_run(self) -> bool:
-        """Cached control state with TTL to avoid excessive file I/O"""
+        """Check control state with instant reload (no cache)"""
         now = time.time()
         if now - self._last_load > self._cache_ttl:
             self.load()
         return self.running
+    
+    def force_reload(self):
+        """Force reload control state immediately"""
+        self.load()
 
 # ----------------------------- Telegram Handler -----------------------------
 class TelegramHandler:
@@ -499,9 +515,27 @@ class TelegramHandler:
             async with self.session.post(url, json=payload, timeout=10) as resp:
                 if resp.status == 200:
                     logger.info(f"✓ Alert sent: {opp.title[:50]}")
+                elif resp.status == 429:
+                    # Rate limited - wait and retry once
+                    data = await resp.json()
+                    retry_after = data.get('parameters', {}).get('retry_after', 2)
+                    logger.warning(f"⚠️ Rate limited, waiting {retry_after}s before retry")
+                    await asyncio.sleep(retry_after)
+                    
+                    # Retry once
+                    async with self.session.post(url, json=payload, timeout=10) as retry_resp:
+                        if retry_resp.status == 200:
+                            logger.info(f"✓ Alert sent (retry): {opp.title[:50]}")
+                        else:
+                            error = await retry_resp.text()
+                            logger.error(f"Telegram retry error: {error[:200]}")
                 else:
                     error = await resp.text()
                     logger.error(f"Telegram error: {error[:200]}")
+            
+            # Rate limiting: wait between messages to avoid 429 errors
+            await asyncio.sleep(1.5)
+            
         except Exception as e:
             logger.error(f"Failed to send alert: {e}")
     
@@ -554,6 +588,7 @@ class TelegramHandler:
     async def _handle_start(self):
         was_stopped = not self.control.running
         self.control.start()
+        self.control.force_reload()  # Force immediate reload
         
         mode = "India\\-only" if self.control.india_only else "Global"
         
@@ -566,11 +601,12 @@ class TelegramHandler:
         msg += f"Status updated: {datetime.now().strftime('%H\\:%M')}"
         
         await self._send_message(msg)
-        logger.info(f"✅ Monitoring started (mode: {mode})")
+        logger.info(f"✅ Monitoring started via /start (mode: {mode})")
     
     async def _handle_stop(self):
         was_running = self.control.running
         self.control.stop()
+        self.control.force_reload()  # Force immediate reload
         
         msg = "⏸️ *Monitoring STOPPED*\n\n"
         if was_running:
@@ -609,6 +645,7 @@ class TelegramHandler:
     
     async def _handle_global(self):
         self.control.set_global()
+        self.control.force_reload()  # Force immediate reload for instant effect
         
         all_opps = self.stats.opportunities
         india_opps = self.stats.get_india_opportunities()
@@ -686,6 +723,7 @@ class TelegramHandler:
     async def _handle_india_report(self):
         """Generate India-specific opportunities report and switch to India-only mode"""
         self.control.set_india_only()
+        self.control.force_reload()  # Force immediate reload for instant effect
         
         india_opps = self.stats.get_india_opportunities()
         
@@ -835,6 +873,11 @@ class RedditMonitor:
                 else:
                     total_found += result
             
+            # Check control state between batches
+            if not self.control.should_run():
+                logger.warning("⚠️ Scan interrupted - monitoring stopped")
+                break
+            
             # Rate limit between batches
             await asyncio.sleep(1.0)
         
@@ -853,8 +896,9 @@ class RedditMonitor:
                 count = 0
                 
                 async for sub in subreddit.search(kw, sort='new', time_filter='day', limit=15):
+                    # Check control state more frequently during processing
                     if not self.control.should_run():
-                        logger.warning("⚠️ Submission processing interrupted by stop command")
+                        logger.warning("⚠️ Submission processing interrupted - monitoring stopped")
                         break
                     
                     count += 1
@@ -898,7 +942,7 @@ class RedditMonitor:
                         await self.state.mark_seen(post_id)
                     
                     if not self.control.should_run():
-                        logger.warning("⚠️ Stop command detected, halting scan")
+                        logger.warning("⚠️ Stop command detected during processing")
                         break
                     
                     await asyncio.sleep(0.3)
@@ -1002,10 +1046,84 @@ class RedditMonitor:
         if self.reddit:
             await self.reddit.close()
 
+# ----------------------------- Health Check Server -----------------------------
+class HealthCheckServer:
+    def __init__(self, control, stats, state):
+        self.control = control
+        self.stats = stats
+        self.state = state
+        self.app = web.Application()
+        self.app.router.add_get('/', self.health_check)
+        self.app.router.add_get('/health', self.health_check)
+        self.app.router.add_get('/status', self.status_check)
+        self.runner = None
+        self.site = None
+        self.start_time = time.time()
+    
+    async def health_check(self, request):
+        """Simple health check endpoint"""
+        return web.json_response({
+            'status': 'healthy',
+            'uptime_seconds': int(time.time() - self.start_time),
+            'timestamp': datetime.now(UTC).isoformat()
+        })
+    
+    async def status_check(self, request):
+        """Detailed status endpoint"""
+        uptime = int(time.time() - self.start_time)
+        return web.json_response({
+            'status': 'running' if self.control.running else 'paused',
+            'mode': 'india_only' if self.control.india_only else 'global',
+            'uptime_seconds': uptime,
+            'uptime_hours': round(uptime / 3600, 2),
+            'opportunities_today': len(self.stats.opportunities),
+            'india_opportunities': len(self.stats.get_india_opportunities()),
+            'seen_posts': len(self.state.seen_posts),
+            'timestamp': datetime.now(UTC).isoformat()
+        })
+    
+    async def start(self):
+        """Start the health check server"""
+        try:
+            self.runner = web.AppRunner(self.app)
+            await self.runner.setup()
+            self.site = web.TCPSite(self.runner, '0.0.0.0', HEALTH_CHECK_PORT)
+            await self.site.start()
+            logger.info(f"✅ Health check server started on port {HEALTH_CHECK_PORT}")
+            logger.info(f"   Health endpoint: http://0.0.0.0:{HEALTH_CHECK_PORT}/health")
+            logger.info(f"   Status endpoint: http://0.0.0.0:{HEALTH_CHECK_PORT}/status")
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                logger.warning(f"⚠️ Port {HEALTH_CHECK_PORT} already in use, trying alternative ports...")
+                # Try alternative ports
+                for alt_port in [8081, 8082, 8083, 8084, 8085]:
+                    try:
+                        self.site = web.TCPSite(self.runner, '0.0.0.0', alt_port)
+                        await self.site.start()
+                        logger.info(f"✅ Health check server started on alternative port {alt_port}")
+                        logger.info(f"   Health endpoint: http://0.0.0.0:{alt_port}/health")
+                        logger.info(f"   Status endpoint: http://0.0.0.0:{alt_port}/status")
+                        return
+                    except OSError:
+                        continue
+                logger.error(f"❌ Failed to start health check server - all ports in use")
+            else:
+                logger.error(f"Failed to start health check server: {e}")
+        except Exception as e:
+            logger.error(f"Failed to start health check server: {e}")
+    
+    async def stop(self):
+        """Stop the health check server"""
+        if self.site:
+            await self.site.stop()
+        if self.runner:
+            await self.runner.cleanup()
+        logger.info("Health check server stopped")
+
 # ----------------------------- Main Loop -----------------------------
 async def main():
     logger.info("=" * 80)
-    logger.info("🚀 SEO MONITOR - OPTIMIZED VERSION")
+    logger.info("🚀 SEO MONITOR - INSTANT COMMAND RESPONSE VERSION")
     logger.info("=" * 80)
     
     if not os.path.exists(KEYWORD_FILE):
@@ -1027,10 +1145,14 @@ async def main():
     control = ControlManager()
     tg = TelegramHandler(control, stats)
     monitor = RedditMonitor(km, tg, state, control, stats)
+    health_server = HealthCheckServer(control, stats, state)
     
     logger.info("✅ ALL SYSTEMS READY")
-    logger.info(f"⚙️ Config: BATCH_SIZE={BATCH_SIZE}, CACHE_TTL={CONTROL_CACHE_TTL}s, LRU_SIZE={STATE_MAX_SIZE}")
+    logger.info(f"⚙️ Config: BATCH_SIZE={BATCH_SIZE}, CACHE_TTL={CONTROL_CACHE_TTL}s (INSTANT), LRU_SIZE={STATE_MAX_SIZE}")
     logger.info("=" * 80)
+    
+    # Start health check server
+    await health_server.start()
     
     # Start command polling task
     command_task = asyncio.create_task(command_loop(tg))
@@ -1073,7 +1195,12 @@ async def main():
             logger.info(f"💾 Seen posts: {len(state.seen_posts)} | Total opportunities: {len(stats.opportunities)}")
             logger.info(f"⏳ Waiting {SCAN_INTERVAL}s before next cycle...\n")
             
-            await asyncio.sleep(SCAN_INTERVAL)
+            # Smart wait with frequent control checks (every 1 second for instant response)
+            for _ in range(SCAN_INTERVAL):
+                if not control.should_run():
+                    logger.info("⏸️ Monitoring paused during wait - will resume when started")
+                    break
+                await asyncio.sleep(1)
     
     except asyncio.CancelledError:
         logger.info("Main loop cancelled")
@@ -1103,6 +1230,7 @@ async def main():
         # Close connections
         await tg.close()
         await monitor.close()
+        await health_server.stop()
         
         logger.info("✓ Shutdown complete")
 
